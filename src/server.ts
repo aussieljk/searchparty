@@ -1,6 +1,9 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { Crawler } from "./crawler.ts";
+import type { Route, RouteCtx } from "./routeCtx.ts";
 import type { CrawlEvent } from "./types.ts";
 
 export interface ServeOptions {
@@ -8,7 +11,11 @@ export interface ServeOptions {
   uiDir: string;
   port: number;
   userAgent: string;
+  /** Per-run data dir (screenshots etc.). Defaults to a tmp dir per host+start. */
+  dataDir?: string;
 }
+
+const ROUTES_DIR = join(dirname(fileURLToPath(import.meta.url)), "routes");
 
 const SSE_HEADERS = {
   "content-type": "text/event-stream",
@@ -16,8 +23,53 @@ const SSE_HEADERS = {
   connection: "keep-alive",
 };
 
-export function startServer(opts: ServeOptions) {
+/** Create (and return) the per-run data directory. */
+export function makeDataDir(host: string, startTs: number): string {
+  const dir = join(tmpdir(), "searchparty", `${host}-${startTs}`);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+interface LoadedRoute extends Route {
+  prefix?: string; // set when path ends with /*
+}
+
+/** Dynamically load every src/routes/*.ts and normalize prefix matching. */
+async function loadRoutes(dir: string): Promise<LoadedRoute[]> {
+  const routes: LoadedRoute[] = [];
+  let files: string[] = [];
+  try {
+    files = readdirSync(dir).filter(
+      (f) => (f.endsWith(".ts") || f.endsWith(".js")) && !f.endsWith(".d.ts"),
+    );
+  } catch {
+    return routes;
+  }
+  for (const file of files.sort()) {
+    try {
+      const mod = await import(join(dir, file));
+      const r: Route | undefined = mod.route ?? mod.default;
+      if (!r || typeof r.handler !== "function" || !r.path) continue;
+      const loaded: LoadedRoute = {
+        method: r.method ?? "GET",
+        path: r.path,
+        handler: r.handler,
+        init: r.init,
+      };
+      if (r.path.endsWith("/*")) loaded.prefix = r.path.slice(0, -1); // keep trailing slash
+      routes.push(loaded);
+    } catch (err) {
+      console.error(`  ⚠  Failed to load route ${file}:`, err);
+    }
+  }
+  return routes;
+}
+
+export async function startServer(opts: ServeOptions) {
   const { crawler, uiDir } = opts;
+  const dataDir =
+    opts.dataDir ?? makeDataDir(crawler.host, crawler.getSnapshot().stats.startedAt || Date.now());
+
   const clients = new Set<ReadableStreamDefaultController>();
   const encoder = new TextEncoder();
 
@@ -33,10 +85,37 @@ export function startServer(opts: ServeOptions) {
   };
   crawler.on("event", broadcast);
 
+  // Plugin routes. Modules may subscribe to crawler events at import time.
+  const ctx: RouteCtx = { crawler, origin: crawler.origin, userAgent: opts.userAgent, dataDir };
+  const routes = await loadRoutes(ROUTES_DIR);
+
+  // One-time route setup (e.g. subscribe to crawler events to persist on "done").
+  for (const r of routes) {
+    if (typeof r.init === "function") {
+      try {
+        r.init(ctx);
+      } catch (err) {
+        console.error(`  ⚠  Route init failed for ${r.path}:`, err);
+      }
+    }
+  }
+
+  const matchRoute = (method: string, path: string): LoadedRoute | undefined => {
+    for (const r of routes) {
+      if ((r.method ?? "GET") !== method) continue;
+      if (r.prefix) {
+        if (path.startsWith(r.prefix)) return r;
+      } else if (r.path === path) {
+        return r;
+      }
+    }
+    return undefined;
+  };
+
   return Bun.serve({
     port: opts.port,
     idleTimeout: 0,
-    async fetch(req, server) {
+    async fetch(req) {
       const url = new URL(req.url);
       const path = url.pathname;
 
@@ -73,9 +152,35 @@ export function startServer(opts: ServeOptions) {
         return proxyPage(url.searchParams.get("url"), crawler.host, opts.userAgent);
       }
 
+      // ---- Built-in: serve captured screenshots from the data dir ----
+      if (path === "/api/screenshot") {
+        return serveScreenshot(url.searchParams.get("id"), dataDir);
+      }
+
+      // ---- Plugin routes (src/routes/*.ts) ----
+      const route = matchRoute(req.method, path);
+      if (route) {
+        try {
+          return await route.handler(req, url, ctx);
+        } catch (err) {
+          return new Response(`Route error: ${err instanceof Error ? err.message : err}`, {
+            status: 500,
+          });
+        }
+      }
+
       // ---- Static UI ----
       return serveStatic(path, uiDir);
     },
+  });
+}
+
+async function serveScreenshot(id: string | null, dataDir: string): Promise<Response> {
+  if (!id || !/^[a-f0-9]{1,64}$/i.test(id)) return new Response("Bad id", { status: 400 });
+  const file = Bun.file(join(dataDir, "screenshots", `${id}.png`));
+  if (!(await file.exists())) return new Response("Not found", { status: 404 });
+  return new Response(file, {
+    headers: { "content-type": "image/png", "cache-control": "no-cache" },
   });
 }
 

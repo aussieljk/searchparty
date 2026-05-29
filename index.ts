@@ -2,7 +2,8 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Crawler, normalizeOrigin } from "./src/crawler.ts";
-import { startServer, uiBuilt } from "./src/server.ts";
+import { Renderer } from "./src/render.ts";
+import { makeDataDir, startServer, uiBuilt } from "./src/server.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "ui", "dist");
@@ -41,6 +42,9 @@ function help() {
     --concurrency=<n> Parallel requests        (default 6)
     --port=<n>       Dashboard port            (default 4477, auto-bumps if busy)
     --sitemap-only   Don't follow on-page links, only sitemap + homepage
+    --render         Render pages with a headless Chrome (full SPA DOM + screenshots).
+                     Needs a local Chrome/Chromium (or PUPPETEER_EXECUTABLE_PATH).
+                     Falls back to plain fetch() if unavailable. (default off)
     --no-open        Don't auto-open the browser
 `);
 }
@@ -96,16 +100,30 @@ async function main() {
     process.exit(1);
   }
 
+  const render = !!flags.render;
+  const startTs = Date.now();
+  const host = new URL(origin).host;
+  const dataDir = makeDataDir(host, startTs);
+
+  if (render && !Renderer.available()) {
+    console.warn(
+      "\n  ⚠  --render: no Chrome/Chromium found. Set PUPPETEER_EXECUTABLE_PATH or install Chrome.\n" +
+        "     Continuing with plain fetch() (no screenshots).\n",
+    );
+  }
+
   const crawler = new Crawler({
     origin,
     maxPages: Number(flags.max) || 150,
     concurrency: Number(flags.concurrency) || 6,
     followLinks: !flags["sitemap-only"],
     userAgent: USER_AGENT,
+    render,
+    dataDir,
   });
 
   const port = pickPort(Number(flags.port) || 4477);
-  startServer({ crawler, uiDir: UI_DIR, port, userAgent: USER_AGENT });
+  await startServer({ crawler, uiDir: UI_DIR, port, userAgent: USER_AGENT, dataDir });
 
   const dashUrl = `http://localhost:${port}/?origin=${encodeURIComponent(origin)}`;
   console.log(`\n  🎉  search party for ${origin}`);

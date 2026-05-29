@@ -36,6 +36,10 @@ export interface PageResult {
   twitterSite?: string;
   images: MetaImage[];
   issues: string[];
+  /** Screenshot id (served via /api/screenshot?id=...) when --render captured one. */
+  screenshot?: string;
+  /** True when this page was rendered with a headless browser (--render). */
+  rendered?: boolean;
 }
 
 export interface CrawlStats {

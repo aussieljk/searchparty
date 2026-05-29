@@ -51,6 +51,11 @@ export interface PageResult {
 
   /** Issues we flag during analysis (missing title, no og:image, etc.). */
   issues: string[];
+
+  /** Screenshot id (served via /api/screenshot?id=...) when --render captured one. */
+  screenshot?: string;
+  /** True when this page was rendered with a headless browser (--render). */
+  rendered?: boolean;
 }
 
 export interface CrawlStats {

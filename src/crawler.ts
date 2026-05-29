@@ -1,5 +1,9 @@
 import { parse, type HTMLElement } from "node-html-parser";
 import { EventEmitter } from "node:events";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { loadEnrichers, type Enricher, type EnricherCtx } from "./enrich.ts";
+import { Renderer } from "./render.ts";
 import type { CrawlEvent, CrawlStats, MetaImage, PageResult } from "./types.ts";
 
 export interface CrawlerOptions {
@@ -9,7 +13,13 @@ export interface CrawlerOptions {
   /** also follow links found on pages (not just the sitemap). */
   followLinks: boolean;
   userAgent: string;
+  /** Render each page with a headless browser (full SPA DOM + screenshot). */
+  render?: boolean;
+  /** Per-run data dir for screenshots / persistence. */
+  dataDir?: string;
 }
+
+const ENRICHERS_DIR = join(dirname(fileURLToPath(import.meta.url)), "enrichers");
 
 const SKIP_EXTENSIONS =
   /\.(?:png|jpe?g|gif|svg|webp|avif|ico|css|js|mjs|json|xml|pdf|zip|gz|mp4|webm|mp3|wav|woff2?|ttf|eot|rss|atom)(?:$|\?)/i;
@@ -30,12 +40,17 @@ export class Crawler extends EventEmitter {
   private stats: CrawlStats;
   private started = false;
   private aborted = false;
+  private enrichers: Enricher[] = [];
+  private renderer: Renderer | null = null;
 
   constructor(opts: CrawlerOptions) {
     super();
     this.opts = opts;
     this.origin = opts.origin;
     this.host = new URL(opts.origin).host;
+    if (opts.render && opts.dataDir) {
+      this.renderer = new Renderer({ dataDir: opts.dataDir, userAgent: opts.userAgent });
+    }
     this.stats = {
       origin: this.origin,
       startedAt: 0,
@@ -95,6 +110,9 @@ export class Crawler extends EventEmitter {
     this.started = true;
     this.stats.startedAt = Date.now();
 
+    // Load plugin enrichers (cached after first load).
+    this.enrichers = await loadEnrichers(ENRICHERS_DIR);
+
     // Seed: homepage + anything in sitemap.xml.
     this.enqueue(this.origin + "/", 0);
     const sitemapUrls = await this.fetchSitemapUrls();
@@ -102,6 +120,9 @@ export class Crawler extends EventEmitter {
     this.emitStats();
 
     await this.drain();
+
+    // Release the headless browser once the crawl is finished.
+    await this.renderer?.close();
 
     this.stats.done = true;
     this.stats.inFlight = 0;
@@ -184,6 +205,9 @@ export class Crawler extends EventEmitter {
       issues: [],
     };
 
+    let html: string | undefined;
+    let screenshotPath: string | undefined;
+
     try {
       const res = await fetch(url, {
         headers: { "user-agent": this.opts.userAgent, accept: "text/html,application/xhtml+xml" },
@@ -201,10 +225,43 @@ export class Crawler extends EventEmitter {
       } else if (result.contentType && !/text\/html|application\/xhtml/i.test(result.contentType)) {
         result.error = `Skipped non-HTML (${result.contentType.split(";")[0]})`;
       } else {
-        const html = await res.text();
-        this.extract(html, result);
+        html = await res.text();
+
+        // Optional headless render: replaces the fetched body with the full DOM
+        // (great for SPAs) and captures a screenshot. Falls back to fetch() body.
+        if (this.renderer) {
+          const rendered = await this.renderer.render(result.finalUrl);
+          if (rendered) {
+            html = rendered.renderedHtml;
+            screenshotPath = rendered.screenshotPath;
+            result.rendered = true;
+            result.screenshot = Renderer.screenshotId(result.finalUrl);
+          }
+        }
+
+        const root = this.extract(html, result);
         if (this.opts.followLinks && depth < 6) {
           for (const href of result._links ?? []) this.enqueue(href, depth + 1);
+        }
+
+        // Run plugin enrichers after base extraction, before emit. Resilient:
+        // a misbehaving enricher cannot break the crawl.
+        if (this.enrichers.length) {
+          const ctx: EnricherCtx = {
+            page: result,
+            html,
+            root,
+            origin: this.origin,
+            userAgent: this.opts.userAgent,
+            screenshotPath,
+          };
+          for (const enrich of this.enrichers) {
+            try {
+              await enrich(ctx);
+            } catch (err) {
+              console.error(`  ⚠  enricher error on ${result.finalUrl}:`, err);
+            }
+          }
         }
       }
     } catch (err) {
@@ -222,8 +279,8 @@ export class Crawler extends EventEmitter {
     this.emitStats();
   }
 
-  /** Parse HTML and fill the SEO fields on `result`. */
-  private extract(html: string, result: PageResult & { _links?: string[] }) {
+  /** Parse HTML, fill the SEO fields on `result`, and return the parsed root. */
+  private extract(html: string, result: PageResult & { _links?: string[] }): HTMLElement {
     const root = parse(html, {
       blockTextElements: { script: false, style: false, noscript: false },
     });
@@ -306,6 +363,8 @@ export class Crawler extends EventEmitter {
       }
       result._links = links;
     }
+
+    return root;
   }
 
   /** Flag common SEO problems for the dashboard. */

@@ -5,6 +5,7 @@ import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetHeader, SheetPopup, SheetTitle } from "@/components/ui/sheet";
 import { cn } from "@/lib/utils";
 import { displayTitle, pathOf, scoreTier, seoScore } from "@/lib/seo";
+import { featureDetails } from "@/features/registry";
 import type { PageResult } from "@/types";
 
 export function PageDetail({
@@ -43,14 +44,35 @@ export function PageDetail({
 
           <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 pb-8">
             <Summary page={page} />
+            {page.screenshot && <Screenshot page={page} />}
             {!page.error && <LivePreview page={page} />}
             {page.images.length > 0 && <ImageGallery page={page} />}
             <MetaSections page={page} />
             <Issues page={page} />
+            {/* Feature-contributed detail sections (ui/src/features/<name>/detail.tsx). */}
+            {featureDetails.map(({ id, Component }) => (
+              <Component key={id} page={page} />
+            ))}
           </div>
         </SheetPopup>
       )}
     </Sheet>
+  );
+}
+
+function Screenshot({ page }: { page: PageResult }) {
+  return (
+    <Section title="Rendered screenshot" icon={<Monitor size={14} />}>
+      <div className="overflow-hidden rounded-lg border bg-white">
+        <img
+          src={`/api/screenshot?id=${encodeURIComponent(page.screenshot!)}`}
+          alt="Rendered page screenshot"
+          className="w-full"
+          loading="lazy"
+          onError={(e) => (e.currentTarget.parentElement!.style.display = "none")}
+        />
+      </div>
+    </Section>
   );
 }
 
