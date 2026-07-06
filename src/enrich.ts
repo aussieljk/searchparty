@@ -29,6 +29,11 @@ export type Enricher = (ctx: EnricherCtx) => Promise<void>;
 
 let cached: Enricher[] | null = null;
 
+/** Clear the module-level enricher cache. Exposed for tests. */
+export function resetEnricherCache(): void {
+  cached = null;
+}
+
 /**
  * Dynamically load every `src/enrichers/*.ts` module and return its default
  * export (an Enricher fn). No shared index file — drop a file in the dir and it

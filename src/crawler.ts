@@ -84,18 +84,8 @@ export class Crawler extends EventEmitter {
 
   /** Add a URL to the frontier if it's new, same-host, and looks like a page. */
   private enqueue(rawUrl: string, depth: number) {
-    let url: URL;
-    try {
-      url = new URL(rawUrl, this.origin);
-    } catch {
-      return;
-    }
-    if (url.protocol !== "http:" && url.protocol !== "https:") return;
-    if (url.host !== this.host) return;
-    if (SKIP_EXTENSIONS.test(url.pathname)) return;
-
-    url.hash = "";
-    const key = url.toString();
+    const key = filterCrawlUrl(rawUrl, this.origin, this.host);
+    if (!key) return;
     if (this.seen.has(key)) return;
     if (this.seen.size >= this.opts.maxPages) return;
 
@@ -168,10 +158,10 @@ export class Crawler extends EventEmitter {
         });
         if (!res.ok) continue;
         const xml = await res.text();
-        const locs = [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)].map((m) => m[1]!.trim());
+        const { locs, isIndex } = parseSitemap(xml);
         // Sitemap index -> fetch nested sitemaps (cap to a few).
         const nested = locs.filter((l) => /sitemap.*\.xml/i.test(l)).slice(0, 5);
-        if (nested.length && /sitemapindex/i.test(xml)) {
+        if (nested.length && isIndex) {
           for (const n of nested) {
             try {
               const r = await fetch(n, {
@@ -180,7 +170,7 @@ export class Crawler extends EventEmitter {
               });
               if (!r.ok) continue;
               const t = await r.text();
-              found.push(...[...t.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)].map((m) => m[1]!.trim()));
+              found.push(...parseSitemap(t).locs);
             } catch {}
           }
         } else {
@@ -281,108 +271,16 @@ export class Crawler extends EventEmitter {
 
   /** Parse HTML, fill the SEO fields on `result`, and return the parsed root. */
   private extract(html: string, result: PageResult & { _links?: string[] }): HTMLElement {
-    const root = parse(html, {
-      blockTextElements: { script: false, style: false, noscript: false },
+    const { fields, root } = extractSeo(html, result.finalUrl, {
+      followLinks: this.opts.followLinks,
     });
-    const base = result.finalUrl;
-    const abs = (href?: string | null) => {
-      if (!href) return undefined;
-      try {
-        return new URL(href, base).toString();
-      } catch {
-        return undefined;
-      }
-    };
-
-    const metaContent = (selector: string): string | undefined => {
-      const el = root.querySelector(selector);
-      const c = el?.getAttribute("content");
-      return c?.trim() || undefined;
-    };
-
-    result.title = root.querySelector("title")?.textContent?.trim() || undefined;
-    result.lang = root.querySelector("html")?.getAttribute("lang")?.trim() || undefined;
-    result.description = metaContent('meta[name="description"]');
-    result.robots = metaContent('meta[name="robots"]');
-    result.canonical = abs(root.querySelector('link[rel="canonical"]')?.getAttribute("href"));
-    result.h1 = root.querySelector("h1")?.textContent?.trim().replace(/\s+/g, " ") || undefined;
-
-    result.ogTitle = metaContent('meta[property="og:title"]');
-    result.ogDescription = metaContent('meta[property="og:description"]');
-    result.ogType = metaContent('meta[property="og:type"]');
-    result.ogSiteName = metaContent('meta[property="og:site_name"]');
-    result.ogUrl = metaContent('meta[property="og:url"]');
-
-    result.twitterCard = metaContent('meta[name="twitter:card"]');
-    result.twitterTitle = metaContent('meta[name="twitter:title"]');
-    result.twitterDescription = metaContent('meta[name="twitter:description"]');
-    result.twitterSite = metaContent('meta[name="twitter:site"]');
-
-    // Favicon
-    const iconEl =
-      root.querySelector('link[rel="icon"]') ??
-      root.querySelector('link[rel="shortcut icon"]') ??
-      root.querySelector('link[rel="apple-touch-icon"]');
-    result.favicon = abs(iconEl?.getAttribute("href")) ?? abs("/favicon.ico");
-
-    // Images (og + twitter), deduped, absolute.
-    const images: MetaImage[] = [];
-    const pushImg = (selector: string, source: string) => {
-      for (const el of root.querySelectorAll(selector)) {
-        const u = abs(el.getAttribute("content"));
-        if (u) images.push({ url: u, source });
-      }
-    };
-    pushImg('meta[property="og:image"]', "og:image");
-    pushImg('meta[property="og:image:url"]', "og:image");
-    pushImg('meta[name="twitter:image"]', "twitter:image");
-    pushImg('meta[name="twitter:image:src"]', "twitter:image");
-    // Pair og:image:alt / width / height with the last og:image.
-    const ogAlt = metaContent('meta[property="og:image:alt"]');
-    const ogW = metaContent('meta[property="og:image:width"]');
-    const ogH = metaContent('meta[property="og:image:height"]');
-    const firstOg = images.find((i) => i.source === "og:image");
-    if (firstOg) {
-      if (ogAlt) firstOg.alt = ogAlt;
-      if (ogW) firstOg.width = Number(ogW) || undefined;
-      if (ogH) firstOg.height = Number(ogH) || undefined;
-    }
-    const seenImg = new Set<string>();
-    result.images = images.filter((i) => (seenImg.has(i.url) ? false : (seenImg.add(i.url), true)));
-
-    // Word count (rough) from body text.
-    const bodyText = root.querySelector("body")?.textContent ?? "";
-    result.wordCount = bodyText.trim().split(/\s+/).filter(Boolean).length;
-
-    // Collect links for the frontier.
-    if (this.opts.followLinks) {
-      const links: string[] = [];
-      for (const a of root.querySelectorAll("a[href]")) {
-        const href = a.getAttribute("href");
-        if (href) links.push(href);
-      }
-      result._links = links;
-    }
-
+    Object.assign(result, fields);
     return root;
   }
 
   /** Flag common SEO problems for the dashboard. */
   private analyze(r: PageResult) {
-    if (r.error) return;
-    if (!r.title) r.issues.push("Missing <title>");
-    else if (r.title.length > 60) r.issues.push("Title over 60 chars");
-    else if (r.title.length < 15) r.issues.push("Title under 15 chars");
-
-    if (!r.description) r.issues.push("Missing meta description");
-    else if (r.description.length > 160) r.issues.push("Description over 160 chars");
-
-    if (!r.canonical) r.issues.push("No canonical URL");
-    if (!r.ogTitle && !r.ogDescription) r.issues.push("No Open Graph tags");
-    if (r.images.length === 0) r.issues.push("No social preview image");
-    if (!r.twitterCard) r.issues.push("No Twitter card");
-    if (r.robots && /noindex/i.test(r.robots)) r.issues.push("noindex");
-    if (!r.h1) r.issues.push("No <h1>");
+    r.issues = analyzeIssues(r);
   }
 }
 
@@ -398,4 +296,162 @@ export function normalizeOrigin(input: string): string {
   if (!/^https?:\/\//i.test(s)) s = "https://" + s;
   const u = new URL(s);
   return u.origin;
+}
+
+/**
+ * Frontier filter: given a raw (possibly relative) URL, decide whether it
+ * belongs in the crawl and return its canonical key (hash stripped, absolute).
+ * Returns `null` when the URL is off-host, not http(s), an asset, or unparseable.
+ * Pure — the stateful `seen`/`maxPages` checks live in the crawler.
+ */
+export function filterCrawlUrl(rawUrl: string, origin: string, host: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(rawUrl, origin);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.host !== host) return null;
+  if (SKIP_EXTENSIONS.test(url.pathname)) return null;
+  url.hash = "";
+  return url.toString();
+}
+
+/**
+ * Parse `<loc>` entries out of a sitemap (or sitemap index) XML document.
+ * `isIndex` is true when the doc is a `<sitemapindex>` (its locs point at
+ * nested sitemaps rather than pages). Pure — no network.
+ */
+export function parseSitemap(xml: string): { locs: string[]; isIndex: boolean } {
+  const locs = [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)].map((m) => m[1]!.trim());
+  return { locs, isIndex: /sitemapindex/i.test(xml) };
+}
+
+/** Fields extracted from a page's HTML (mirrors the SEO slice of PageResult). */
+export interface ExtractedSeo extends Partial<PageResult> {
+  images: MetaImage[];
+  /** Collected on-page links (only populated when `followLinks` is set). */
+  _links?: string[];
+}
+
+/**
+ * Pure SEO/meta extraction: parse HTML and pull title, description, canonical,
+ * Open Graph, Twitter, favicon, social images (deduped + absolutised against
+ * `finalUrl`), word count and (optionally) on-page links. Returns the parsed
+ * root so callers can run enrichers over the same tree.
+ */
+export function extractSeo(
+  html: string,
+  finalUrl: string,
+  opts: { followLinks?: boolean } = {},
+): { fields: ExtractedSeo; root: HTMLElement } {
+  const root = parse(html, {
+    blockTextElements: { script: false, style: false, noscript: false },
+  });
+  const fields: ExtractedSeo = { images: [] };
+  const base = finalUrl;
+  const abs = (href?: string | null) => {
+    if (!href) return undefined;
+    try {
+      return new URL(href, base).toString();
+    } catch {
+      return undefined;
+    }
+  };
+
+  const metaContent = (selector: string): string | undefined => {
+    const el = root.querySelector(selector);
+    const c = el?.getAttribute("content");
+    return c?.trim() || undefined;
+  };
+
+  fields.title = root.querySelector("title")?.textContent?.trim() || undefined;
+  fields.lang = root.querySelector("html")?.getAttribute("lang")?.trim() || undefined;
+  fields.description = metaContent('meta[name="description"]');
+  fields.robots = metaContent('meta[name="robots"]');
+  fields.canonical = abs(root.querySelector('link[rel="canonical"]')?.getAttribute("href"));
+  fields.h1 = root.querySelector("h1")?.textContent?.trim().replace(/\s+/g, " ") || undefined;
+
+  fields.ogTitle = metaContent('meta[property="og:title"]');
+  fields.ogDescription = metaContent('meta[property="og:description"]');
+  fields.ogType = metaContent('meta[property="og:type"]');
+  fields.ogSiteName = metaContent('meta[property="og:site_name"]');
+  fields.ogUrl = metaContent('meta[property="og:url"]');
+
+  fields.twitterCard = metaContent('meta[name="twitter:card"]');
+  fields.twitterTitle = metaContent('meta[name="twitter:title"]');
+  fields.twitterDescription = metaContent('meta[name="twitter:description"]');
+  fields.twitterSite = metaContent('meta[name="twitter:site"]');
+
+  // Favicon
+  const iconEl =
+    root.querySelector('link[rel="icon"]') ??
+    root.querySelector('link[rel="shortcut icon"]') ??
+    root.querySelector('link[rel="apple-touch-icon"]');
+  fields.favicon = abs(iconEl?.getAttribute("href")) ?? abs("/favicon.ico");
+
+  // Images (og + twitter), deduped, absolute.
+  const images: MetaImage[] = [];
+  const pushImg = (selector: string, source: string) => {
+    for (const el of root.querySelectorAll(selector)) {
+      const u = abs(el.getAttribute("content"));
+      if (u) images.push({ url: u, source });
+    }
+  };
+  pushImg('meta[property="og:image"]', "og:image");
+  pushImg('meta[property="og:image:url"]', "og:image");
+  pushImg('meta[name="twitter:image"]', "twitter:image");
+  pushImg('meta[name="twitter:image:src"]', "twitter:image");
+  // Pair og:image:alt / width / height with the first og:image.
+  const ogAlt = metaContent('meta[property="og:image:alt"]');
+  const ogW = metaContent('meta[property="og:image:width"]');
+  const ogH = metaContent('meta[property="og:image:height"]');
+  const firstOg = images.find((i) => i.source === "og:image");
+  if (firstOg) {
+    if (ogAlt) firstOg.alt = ogAlt;
+    if (ogW) firstOg.width = Number(ogW) || undefined;
+    if (ogH) firstOg.height = Number(ogH) || undefined;
+  }
+  const seenImg = new Set<string>();
+  fields.images = images.filter((i) => (seenImg.has(i.url) ? false : (seenImg.add(i.url), true)));
+
+  // Word count (rough) from body text.
+  const bodyText = root.querySelector("body")?.textContent ?? "";
+  fields.wordCount = bodyText.trim().split(/\s+/).filter(Boolean).length;
+
+  // Collect links for the frontier.
+  if (opts.followLinks) {
+    const links: string[] = [];
+    for (const a of root.querySelectorAll("a[href]")) {
+      const href = a.getAttribute("href");
+      if (href) links.push(href);
+    }
+    fields._links = links;
+  }
+
+  return { fields, root };
+}
+
+/**
+ * Flag common SEO problems for the dashboard. Pure — returns the issue list for
+ * a scraped page (empty when the page errored, matching the original behaviour).
+ */
+export function analyzeIssues(r: PageResult): string[] {
+  const issues: string[] = [];
+  if (r.error) return issues;
+  if (!r.title) issues.push("Missing <title>");
+  else if (r.title.length > 60) issues.push("Title over 60 chars");
+  else if (r.title.length < 15) issues.push("Title under 15 chars");
+
+  if (!r.description) issues.push("Missing meta description");
+  else if (r.description.length > 160) issues.push("Description over 160 chars");
+
+  if (!r.canonical) issues.push("No canonical URL");
+  if (!r.ogTitle && !r.ogDescription) issues.push("No Open Graph tags");
+  if (r.images.length === 0) issues.push("No social preview image");
+  if (!r.twitterCard) issues.push("No Twitter card");
+  if (r.robots && /noindex/i.test(r.robots)) issues.push("noindex");
+  if (!r.h1) issues.push("No <h1>");
+  return issues;
 }

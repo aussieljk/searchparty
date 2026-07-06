@@ -13,6 +13,24 @@ preview, title, description, HTTP status, and an SEO score. Click any card for a
 full breakdown: live page render, every social image, all Open Graph / Twitter /
 SEO tags, and flagged issues.
 
+## Install
+
+searchparty runs on [Bun](https://bun.sh). Run it without installing:
+
+```bash
+bunx searchparty veraison.com.au
+```
+
+…or install it globally so `searchparty` is on your PATH:
+
+```bash
+bun add -g searchparty
+searchparty veraison.com.au
+```
+
+> Requires Bun (the CLI ships as TypeScript with a `bun` shebang). The dashboard
+> UI is pre-built into the published package — no build step needed.
+
 ## Usage
 
 ```bash
@@ -129,7 +147,15 @@ bun run index.ts veraison.com.au   # run locally
 
 # Live UI dev (run the CLI on :4477 in one terminal, then):
 bun run dev:ui       # vite dev server, proxies /api to the CLI
+
+bun test             # run the test suite (pure SEO/crawl logic, no network)
+bun run typecheck    # backend tsc
+bun run check:types  # verify ui/src/types.ts is in sync with src/types.ts
 ```
+
+`ui/src/types.ts` is generated from `src/types.ts` by `bun run sync:types`
+(also run automatically as part of `bun run build`), so the shared types never
+drift. Edit `src/types.ts`, never the UI copy.
 
 To make the `searchparty` command available globally for local use:
 

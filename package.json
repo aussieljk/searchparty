@@ -17,7 +17,10 @@
     "dev": "bun run index.ts",
     "dev:ui": "cd ui && bun run dev",
     "build:ui": "cd ui && bun install && bun run build",
-    "build": "bun run build:ui",
+    "build": "bun run sync:types && bun run build:ui",
+    "test": "bun test",
+    "sync:types": "bun run scripts/sync-ui-types.ts",
+    "check:types": "bun run scripts/sync-ui-types.ts --check",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "bun run build"
   },
