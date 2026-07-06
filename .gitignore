@@ -1,5 +1,9 @@
 node_modules/
 ui/node_modules/
 ui/dist/
+dist/
 *.log
 .DS_Store
+.env
+.env.*
+*.local
